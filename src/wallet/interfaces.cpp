@@ -8,15 +8,22 @@
 #include <consensus/amount.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
+#include <key_io.h>
 #include <node/types.h>
 #include <policy/fees/block_policy_estimator.h>
 #include <primitives/transaction.h>
 #include <rpc/server.h>
 #include <scheduler.h>
+#include <serialize.h>
+#include <streams.h>
 #include <support/allocators/secure.h>
 #include <sync.h>
 #include <uint256.h>
 #include <util/check.h>
+#include <util/log.h>
+#include <util/strencodings.h>
+#include <util/string.h>
+#include <util/time.h>
 #include <util/translation.h>
 #include <util/ui_change_type.h>
 #include <wallet/coincontrol.h>
@@ -45,6 +52,7 @@ using interfaces::WalletBalances;
 using interfaces::WalletLoader;
 using interfaces::WalletMigrationResult;
 using interfaces::WalletOrderForm;
+using interfaces::WalletReceiveRequest;
 using interfaces::WalletTx;
 using interfaces::WalletTxOut;
 using interfaces::WalletTxStatus;
@@ -54,6 +62,43 @@ namespace wallet {
 // All members of the classes in this namespace are intentionally public, as the
 // classes themselves are private.
 namespace {
+
+//! Serialization-compatible mirror of SendCoinsRecipient (defined in Qt code)
+//! without Qt dependencies. Field order and types must match exactly to
+//! produce byte-identical serialized output for DB compatibility.
+struct RecipientData
+{
+    int nVersion{1};
+    std::string address;
+    std::string label;
+    CAmount amount{0};
+    std::string message;
+    std::string sPaymentRequest;
+    std::string authenticatedMerchant;
+
+    SERIALIZE_METHODS(RecipientData, obj)
+    {
+        READWRITE(obj.nVersion, obj.address, obj.label, obj.amount,
+                  obj.message, obj.sPaymentRequest, obj.authenticatedMerchant);
+    }
+};
+
+//! Serialization-compatible mirror of RecentRequestEntry (defined in Qt code)
+//! without Qt dependencies. Used to read and write receive request blobs
+//! stored in the wallet database.
+struct RequestEntryData
+{
+    int nVersion{1};
+    int64_t id{0};
+    unsigned int date_timet{0};
+    RecipientData recipient;
+
+    SERIALIZE_METHODS(RequestEntryData, obj)
+    {
+        READWRITE(obj.nVersion, obj.id, obj.date_timet, obj.recipient);
+    }
+};
+
 //! Construct wallet tx struct.
 WalletTx MakeWalletTx(CWallet& wallet, const CWalletTx& wtx)
 {
@@ -210,27 +255,73 @@ public:
         });
         return result;
     }
-    std::vector<std::string> getAddressReceiveRequests() override {
+    std::vector<WalletReceiveRequest> getReceiveRequests() override
+    {
         LOCK(m_wallet->cs_wallet);
-        return m_wallet->GetAddressReceiveRequests();
+        std::vector<WalletReceiveRequest> result;
+        for (const auto& [dest, entry] : m_wallet->m_address_book) {
+            const std::string address = EncodeDestination(dest);
+            for (const auto& [id_str, data] : entry.receive_requests) {
+                try {
+                    RequestEntryData parsed;
+                    SpanReader{MakeByteSpan(data)} >> parsed;
+                    if (parsed.id == 0) continue;
+                    WalletReceiveRequest req;
+                    req.id = parsed.id;
+                    req.time = parsed.date_timet;
+                    req.address = address;
+                    req.label = std::move(parsed.recipient.label);
+                    req.message = std::move(parsed.recipient.message);
+                    req.amount = parsed.recipient.amount;
+                    result.emplace_back(std::move(req));
+                } catch (const std::exception& e) {
+                    LogWarning("Could not deserialize receive request %s for %s: %s",
+                               id_str, address, e.what());
+                }
+            }
+        }
+        return result;
     }
-    bool setAddressReceiveRequest(const CTxDestination& dest, const std::string& id, const std::string& value) override {
-        // Note: The setAddressReceiveRequest interface used by the GUI to store
-        // receive requests is a little awkward and could be improved in the
-        // future:
-        //
-        // - The same method is used to save requests and erase them, but
-        //   having separate methods could be clearer and prevent bugs.
-        //
-        // - Request ids are passed as strings even though they are generated as
-        //   integers.
-        //
-        // - Multiple requests can be stored for the same address, but it might
-        //   be better to only allow one request or only keep the current one.
+    std::optional<int64_t> addReceiveRequest(const WalletReceiveRequest& request) override
+    {
+        LOCK(m_wallet->cs_wallet);
+        const CTxDestination dest = DecodeDestination(request.address);
+        if (!IsValidDestination(dest)) return std::nullopt;
+
+        // Determine next ID from the map keys (which are string forms of
+        // integer IDs) across all addresses.
+        int64_t max_id{0};
+        for (const auto& [_, addr_entry] : m_wallet->m_address_book) {
+            for (const auto& [id_str, request_data] : addr_entry.receive_requests) {
+                if (auto id = ToIntegral<int64_t>(id_str)) {
+                    if (*id > max_id) max_id = *id;
+                }
+            }
+        }
+        const int64_t new_id = max_id + 1;
+
+        RequestEntryData entry;
+        entry.id = new_id;
+        entry.date_timet = static_cast<unsigned int>(GetTime());
+        entry.recipient.address = request.address;
+        entry.recipient.label = request.label;
+        entry.recipient.message = request.message;
+        entry.recipient.amount = request.amount;
+
+        DataStream ss{};
+        ss << entry;
+
+        WalletBatch batch{m_wallet->GetDatabase()};
+        if (!m_wallet->SetAddressReceiveRequest(batch, dest, util::ToString(new_id), ss.str())) {
+            return std::nullopt;
+        }
+        return new_id;
+    }
+    bool eraseReceiveRequest(const CTxDestination& dest, int64_t id) override
+    {
         LOCK(m_wallet->cs_wallet);
         WalletBatch batch{m_wallet->GetDatabase()};
-        return value.empty() ? m_wallet->EraseAddressReceiveRequest(batch, dest, id)
-                             : m_wallet->SetAddressReceiveRequest(batch, dest, id, value);
+        return m_wallet->EraseAddressReceiveRequest(batch, dest, util::ToString(id));
     }
     util::Result<void> displayAddress(const CTxDestination& dest) override
     {
